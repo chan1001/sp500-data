@@ -1,0 +1,182 @@
+name: PQM - Sync historical index membership sources
+
+on:
+  schedule:
+    # Every Saturday 13:37 UTC; independent of existing S&P 500 release sync.
+    - cron: '37 13 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pqm-historical-index-source-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_REPO: ${{ github.repository }}
+      CURRENT_TAG: pqm-index-sources-current
+    steps:
+      - name: Fetch public repositories (do not execute upstream code)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/sources work/out
+          for spec in \
+            'jmccarrell/n100tickers|n100tickers|main' \
+            'fja05680/sp500|fja_sp500|master' \
+            'hanshof/sp500_constituents|hanshof_sp500|main' \
+            'thuningxu/sp500nq100|thuningxu_sp500nq100|main' \
+            'coiltrade/point-in-time-sp500|coiltrade_sp500|main'; do
+            IFS='|' read -r repo key branch <<< "$spec"
+            git clone --quiet --depth 1 --single-branch --branch "$branch" \
+              "https://github.com/${repo}.git" "work/sources/${key}"
+          done
+
+      - name: Validate inputs and create reproducible bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          root = Path('work/sources')
+          out = Path('work/out')
+          # Redistribution limited to repositories with an explicit MIT license.
+          # Other sources are tracked by URL, commit, and SHA-256 ONLY.
+          sources = [
+              ('jmccarrell/n100tickers', 'n100tickers', True,
+               ['pyproject.toml', 'LICENSE']),
+              ('fja05680/sp500', 'fja_sp500', True,
+               ['S&P 500 Historical Components & Changes (Updated).csv', 'LICENSE']),
+              ('hanshof/sp500_constituents', 'hanshof_sp500', True,
+               ['sp_500_historical_components.csv', 'LICENSE']),
+              ('thuningxu/sp500nq100', 'thuningxu_sp500nq100', False,
+               ['nasdaq100_components_history.csv', 'sp500_components_history.csv']),
+              ('coiltrade/point-in-time-sp500', 'coiltrade_sp500', False,
+               ['data/membership.json']),
+          ]
+
+          manifest = {
+              'generated_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'description': 'PQM research source snapshots, not market-truth certification',
+              'sources': [],
+          }
+          signature_material = []
+          to_archive = []
+          for repo, slug, redistribute, must_have in sources:
+              directory = root / slug
+              commit = subprocess.check_output(
+                  ['git', '-C', str(directory), 'rev-parse', 'HEAD'], text=True
+              ).strip()
+              tracked = subprocess.check_output(
+                  ['git', '-C', str(directory), 'ls-files', '-z']
+              ).decode().split('\0')
+              tracked = sorted(f for f in tracked if f)
+              missing = sorted(set(must_have) - set(tracked))
+              if missing:
+                  raise SystemExit(f'{repo}: missing expected files: {missing}')
+              file_info = []
+              for relative in tracked:
+                  path = directory / relative
+                  if not path.is_file():
+                      continue
+                  size = path.stat().st_size
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  file_info.append({'path': relative, 'bytes': size, 'sha256': digest})
+                  if redistribute:
+                      to_archive.append((path, f'sources/{slug}/{relative}'))
+              if not file_info:
+                  raise SystemExit(f'{repo}: no tracked regular files')
+              manifest['sources'].append({
+                  'repository': repo,
+                  'url': f'https://github.com/{repo}',
+                  'commit': commit,
+                  'redistributed_in_bundle': redistribute,
+                  'files': file_info,
+              })
+              # Data-content fingerprint, not a mutable tag or a clone time.
+              signature_material.append({
+                  'repository': repo,
+                  'files': file_info,
+              })
+
+          signature = hashlib.sha256(json.dumps(
+              signature_material, sort_keys=True, separators=(',', ':')
+          ).encode()).hexdigest()
+          manifest['source_signature'] = signature
+          (out / 'source_manifest.json').write_text(
+              json.dumps(manifest, indent=2, ensure_ascii=False) + '\n'
+          )
+          (out / 'source_signature.txt').write_text(signature + '\n')
+          with zipfile.ZipFile(out / 'pqm-index-sources.zip', 'w',
+                               compression=zipfile.ZIP_DEFLATED, compresslevel=7) as z:
+              z.write(out / 'source_manifest.json', 'source_manifest.json')
+              for path, arcname in sorted(to_archive, key=lambda x: x[1]):
+                  z.write(path, arcname)
+          # Verify the ZIP and required entry paths before publication.
+          with zipfile.ZipFile(out / 'pqm-index-sources.zip') as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit(f'Archive CRC error: {bad}')
+              if 'sources/n100tickers/pyproject.toml' not in z.namelist():
+                  raise SystemExit('Nasdaq source files missing from archive')
+          print('source_signature:', signature)
+          print('archive_bytes:', (out / 'pqm-index-sources.zip').stat().st_size)
+          PY
+
+      - name: Compare published fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGNATURE=$(cat work/out/source_signature.txt)
+          echo "SIGNATURE=$SIGNATURE" >> "$GITHUB_ENV"
+          BODY=$(gh release view "$CURRENT_TAG" -R "$TARGET_REPO" \
+                 --json body --jq .body 2>/dev/null || true)
+          if [[ "$BODY" == *"source_signature: $SIGNATURE"* ]]; then
+            echo 'SKIP=true' >> "$GITHUB_ENV"
+            echo 'Unchanged sources; no release upload required.'
+          fi
+
+      - name: Publish current bundle and dated immutable snapshot
+        if: env.SKIP != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATE_UTC=$(date -u +%Y%m%d)
+          SNAPSHOT_TAG="pqm-index-snapshot-${DATE_UTC}-${SIGNATURE:0:10}"
+          NOTES=$(cat <<EOF
+          PQM historical index source snapshot.
+
+          source_signature: $SIGNATURE
+
+          Includes MIT-licensed upstream snapshots (n100tickers, fja05680/sp500, hanshof/sp500_constituents) with their original LICENSE files, plus URL/commit/hash metadata ONLY for thuningxu/sp500nq100 and coiltrade/point-in-time-sp500.
+
+          No Tiingo, Yahoo, Nasdaq or private price data. These are audit inputs, not independently verified market data.
+          EOF
+          )
+          ASSET=work/out/pqm-index-sources.zip
+          if gh release view "$CURRENT_TAG" -R "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$CURRENT_TAG" "$ASSET" -R "$TARGET_REPO" --clobber
+            gh release edit "$CURRENT_TAG" -R "$TARGET_REPO" \
+              --title 'PQM index membership sources - current' --notes "$NOTES"
+          else
+            gh release create "$CURRENT_TAG" "$ASSET" -R "$TARGET_REPO" \
+              --title 'PQM index membership sources - current' \
+              --notes "$NOTES" --latest=false
+          fi
+          if ! gh release view "$SNAPSHOT_TAG" -R "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release create "$SNAPSHOT_TAG" "$ASSET" -R "$TARGET_REPO" \
+              --title "PQM index source snapshot $DATE_UTC" \
+              --notes "$NOTES" --latest=false
+          fi

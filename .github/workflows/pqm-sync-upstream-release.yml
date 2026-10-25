@@ -1,0 +1,160 @@
+name: PQM - Sync upstream S&P 500 release
+
+on:
+  schedule:
+    # Every Saturday after the upstream weekday publication cycle (UTC)
+    - cron: '23 12 * * 6'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'research = core PQM files; all = every Release asset'
+        required: true
+        default: research
+        type: choice
+        options:
+          - research
+          - all
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pqm-upstream-release-sync
+  cancel-in-progress: false
+
+jobs:
+  synchronize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MODE: ${{ github.event.inputs.mode || 'research' }}
+      SOURCE_REPO: Johnbrick123/sp500-data
+      TARGET_REPO: ${{ github.repository }}
+    steps:
+      - name: Download and validate source release, prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging/assets
+          gh api "repos/${SOURCE_REPO}/releases/tags/data" > staging/upstream_release.json
+          python3 - <<'PY'
+          import json, os, hashlib
+          from pathlib import Path
+          release = json.loads(Path('staging/upstream_release.json').read_text())
+          names = [
+              'prices.parquet',
+              'membership_intervals.parquet',
+              'members.parquet',
+              'no_trade_days.csv',
+              'exit_gaps.csv',
+              'recycled_tickers.csv',
+              'verification_report.txt',
+              'full_check_report.txt',
+              'full_check_flagged.csv',
+              'full_check_drift.csv',
+              'crsp_identity.csv',
+              'cross_source_ledger.csv',
+              'nightly_guard.txt',
+              'nightly_alert.txt',
+          ]
+          assets = {a['name']: a for a in release['assets']}
+          chosen = sorted(assets) if os.environ['MODE'] == 'all' else names
+          missing = sorted(set(chosen) - set(assets))
+          if missing:
+              raise SystemExit('Upstream Release missing required files: ' + ', '.join(missing))
+          # Hash asset identity, not the mutable GitHub release tag name.
+          signature_payload = [
+              {k: assets[name][k] for k in ('name', 'id', 'size', 'updated_at')}
+              for name in sorted(chosen)
+          ]
+          signature = hashlib.sha256(json.dumps(signature_payload, sort_keys=True).encode()).hexdigest()
+          Path('staging/selected_assets.txt').write_text('\n'.join(chosen) + '\n')
+          Path('staging/source_signature.txt').write_text(signature + '\n')
+          PY
+          SIGNATURE=$(cat staging/source_signature.txt)
+          if [ "$MODE" = all ]; then
+            TARGET_TAG='pqm-all-current'
+          else
+            TARGET_TAG='pqm-research-current'
+          fi
+          echo "TARGET_TAG=$TARGET_TAG" >> "$GITHUB_ENV"
+          echo "SIGNATURE=$SIGNATURE" >> "$GITHUB_ENV"
+          # Skip identical sets so scheduled runs cause no extra upload.
+          EXISTING=$(gh release view "$TARGET_TAG" -R "$TARGET_REPO" --json body --jq .body 2>/dev/null || true)
+          if echo "$EXISTING" | grep -Fq "source_asset_signature: $SIGNATURE"; then
+            echo "No upstream asset change; nothing to publish."
+            echo 'SKIP=true' >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ARGS=(data --repo "$SOURCE_REPO" --dir staging/assets)
+          while IFS= read -r asset; do
+            ARGS+=(--pattern "$asset")
+          done < staging/selected_assets.txt
+          gh release download "${ARGS[@]}"
+          python3 - <<'PY'
+          import hashlib, json, os, zipfile
+          from pathlib import Path
+          root = Path('staging')
+          release = json.loads((root / 'upstream_release.json').read_text())
+          available = {a['name']: a for a in release['assets']}
+          names = (root / 'selected_assets.txt').read_text().splitlines()
+          manifest = {
+              'source_repository': os.environ['SOURCE_REPO'],
+              'source_release_tag': 'data',
+              'source_release_id': release['id'],
+              'source_release_updated_at': release.get('updated_at'),
+              'sync_mode': os.environ['MODE'],
+              'files': [],
+          }
+          for name in names:
+              asset = available[name]
+              file = root / 'assets' / name
+              if not file.is_file() or file.stat().st_size != asset['size']:
+                  raise SystemExit('Missing / incomplete asset: ' + name)
+              digest = hashlib.sha256()
+              with file.open('rb') as f:
+                  for block in iter(lambda: f.read(8 * 1024 * 1024), b''):
+                      digest.update(block)
+              if asset.get('digest') and asset['digest'].startswith('sha256:'):
+                  if digest.hexdigest() != asset['digest'].split(':', 1)[1]:
+                      raise SystemExit('Upstream SHA256 does not match: ' + name)
+              manifest['files'].append({
+                  'name': name, 'size': asset['size'], 'source_asset_id': asset['id'],
+                  'source_asset_updated_at': asset['updated_at'], 'sha256': digest.hexdigest(),
+              })
+          (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          dest = root / ('sp500-all-release.zip' if os.environ['MODE'] == 'all'
+                         else 'sp500-pqm-research.zip')
+          with zipfile.ZipFile(dest, 'w', compression=zipfile.ZIP_DEFLATED,
+                               compresslevel=1, allowZip64=True) as z:
+              z.write(root / 'manifest.json', 'manifest.json')
+              for name in names:
+                  z.write(root / 'assets' / name, 'assets/' + name)
+          with zipfile.ZipFile(dest) as z:
+              err = z.testzip()
+              if err:
+                  raise SystemExit('ZIP integrity failure: ' + err)
+          print(f'Validated {len(names)} files; generated {dest} ({dest.stat().st_size:,} bytes)')
+          PY
+
+      - name: Publish current bundle in fork Release
+        if: env.SKIP != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = all ]; then
+            PACKAGE='staging/sp500-all-release.zip'
+            TITLE='PQM - Full upstream Release mirror (current)'
+          else
+            PACKAGE='staging/sp500-pqm-research.zip'
+            TITLE='PQM - Research data mirror (current)'
+          fi
+          printf 'Mirrored from %s, tag data.\nsource_asset_signature: %s\nThis tag is mutable; pin historical backtests separately.\n' "$SOURCE_REPO" "$SIGNATURE" > staging/notes.txt
+          if gh release view "$TARGET_TAG" -R "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$TARGET_TAG" "$PACKAGE" --repo "$TARGET_REPO" --clobber
+            gh release edit "$TARGET_TAG" --repo "$TARGET_REPO" --title "$TITLE" --notes-file staging/notes.txt
+          else
+            gh release create "$TARGET_TAG" "$PACKAGE" --repo "$TARGET_REPO" --title "$TITLE" --notes-file staging/notes.txt
+          fi
+          echo "Published ${PACKAGE} to ${TARGET_REPO} release ${TARGET_TAG}"
